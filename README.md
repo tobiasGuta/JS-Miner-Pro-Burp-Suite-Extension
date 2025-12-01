@@ -50,7 +50,7 @@ If you want to modify the code or build it yourself, follow these steps. You nee
 1.  Clone this repository:
 
     ```
-    git clone https://github.com/tobiasGuta/JS-Miner-Pro---Burp-Suite-Extension.git
+    git clone https://github.com/tobiasGuta/JS-Miner-Pro-Burp-Suite-Extension.git
     cd js-miner-pro
 
     ```
