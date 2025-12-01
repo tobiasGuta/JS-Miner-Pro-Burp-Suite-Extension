@@ -30,7 +30,7 @@ Most passive scanners rely on Burp's default scanning scheduler, which often ski
 Installation
 ------------
 
-1.  Download the latest JAR file from the [Releases](https://www.google.com/search?q=https://github.com/yourusername/js-miner-pro/releases "null") page.
+1.  Download the latest JAR file from the [Releases](https://github.com/tobiasGuta/JS-Miner-Pro-Burp-Suite-Extension/releases/download/JsMinerPro-2.0-Pro-all1212025/JsMinerPro-2.0-Pro-all.jar) page.
 
 2.  Open **Burp Suite**.
 
