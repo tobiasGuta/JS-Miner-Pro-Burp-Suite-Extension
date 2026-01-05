@@ -102,10 +102,29 @@ You can customize exactly what the extension looks for.
 
 The extension comes pre-loaded with these battle-tested patterns:
 
-| Rule Name        | Regex                                   | Description        |
-|------------------|-------------------------------------------|--------------------|
-| Relative Paths   | `(?:\"` or `'`                            | —                  |
-| Generic Secrets  | `(?i)((?:api_?key|access_?token)`         | —                  |
+| Rule Name              | Regex |
+|------------------------|-------|
+| Generic High-Entropy Secret | `(?i)(?:secret|token|password|auth|key)['"]?\s*[:=]\s*['"]?([A-Za-z0-9\-_:/.+=]{20,})['"]?` |
+| AWS Key ID             | `(AKIA[0-9A-Z]{16})` |
+| Google API Key         | `(AIza[0-9A-Za-z\-_]{35})` |
+| Stripe Live Key        | `(sk_live_[0-9a-zA-Z]{24,})` |
+| GitHub PAT             | `(ghp_[0-9a-zA-Z]{36})` |
+| Slack Token            | `(xox[baprs]-[0-9a-zA-Z\-]{10,48})` |
+| JWT Token              | `(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)` |
+| Private Key            | `(-----BEGIN (?:RSA |EC )?PRIVATE KEY-----)` |
+| MongoDB URL            | `(mongodb(?:\+srv)?://[^\s"'<>]+)` |
+| PostgreSQL URL         | `(postgres(?:ql)?://[^\s"'<>]+)` |
+| Generic Path           | `['"](/[a-zA-Z0-9/._-]{8,})['"]` |
+| API Endpoint           | `(?i)["']((?:https?:)?//[^"']+/api/[a-zA-Z0-9/_-]+)["']` |
+| GraphQL Path           | `(?i)["'](/graphql[a-zA-Z0-9/_-]*)["']` |
+| Full URL               | `["'](https?://[^\s"'<>]{10,})["']` |
+| WebSocket URL          | `["'](wss?://[^\s"'<>]{10,})["']` |
+| S3 Bucket URL          | `(https?://[a-zA-Z0-9.-]+\.s3[a-zA-Z0-9.-]*\.amazonaws\.com[^\s"'<>']*)` |
+| Azure Blob URL         | `(https?://[a-zA-Z0-9.-]+\.blob\.core\.windows\.net[^\s"'<>']*)` |
+| GCP Storage URL        | `(https?://storage\.googleapis\.com/[^\s"'<>']*)` |
+| Email Address          | `([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})` |
+| Sensitive File         | `(?i)["']([a-zA-Z0-9_/.-]+\.(?:sql|csv|json|xml|yml|log|conf|ini|env|bak|key|pem|crt|pfx))["']` |
+
 
 
 Disclaimer
