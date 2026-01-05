@@ -111,4 +111,16 @@ The extension comes pre-loaded with these battle-tested patterns:
 Disclaimer
 ----------
 
-This tool is for educational and ethical testing purposes only. Usage of this tool for attacking targets without prior mutual consent is illegal. The developer assumes no liability and is not responsible for any misuse or damage caused by this program.
+This tool is for educational purposes and authorized security testing only. Do not use this tool on systems you do not have permission to test. The author is not responsible for any misuse.
+---
+
+<div align="center">
+  <h3>☕ Support My Journey</h3>
+</div>
+
+
+<div align="center">
+  <a href="https://www.buymeacoffee.com/tobiasguta">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" width="200" />
+  </a>
+</div>
