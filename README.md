@@ -219,7 +219,13 @@ The extension comes pre-loaded with these battle-tested patterns:
 | Email Address          | `([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6})` |
 | Sensitive File         | `(?i)["']([a-zA-Z0-9_/.-]+\.(?:sql|csv|json|xml|yml|log|conf|ini|env|bak|key|pem|crt|pfx))["']` |
 
+<img width="1916" height="1002" alt="Screenshot 2026-03-09 224838" src="https://github.com/user-attachments/assets/5f4c4601-b1b2-4448-92df-b9823549cadf" />
 
+<img width="1919" height="995" alt="image" src="https://github.com/user-attachments/assets/834ffe5e-3fc6-4d2a-8218-08d1373f1bfd" />
+
+<img width="1919" height="997" alt="image" src="https://github.com/user-attachments/assets/1b8ea6eb-b55f-4b8b-a8f6-25e7d2ac584a" />
+
+<img width="1919" height="1000" alt="image" src="https://github.com/user-attachments/assets/cfd9d2f8-de5c-426c-b09d-28f8ec520e11" />
 
 Disclaimer
 ----------
