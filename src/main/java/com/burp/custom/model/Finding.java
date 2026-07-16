@@ -4,17 +4,12 @@ import burp.api.montoya.http.message.HttpRequestResponse;
 import java.util.Objects;
 
 public class Finding {
-    private static final int MAX_PERSISTED_REQUEST_CHARS = 16_384;
-    private static final int MAX_PERSISTED_RESPONSE_CHARS = 49_152;
-
     private final String type;
     private final String finding;
     private final String ruleName;
     private final String url;
     private final String severity;
-    private final transient HttpRequestResponse requestResponse;
-    private String requestString;
-    private String responseString;
+    private final String evidenceId;
     private final int start;
     private final int end;
     private final long timestamp;
@@ -22,37 +17,29 @@ public class Finding {
     private final String context;
 
     public Finding(String type, String finding, String ruleName, String url,
-                   HttpRequestResponse requestResponse, int start, int end) {
-        this(type, finding, ruleName, url, requestResponse, start, end, "INFO", "");
+                   String evidenceId, int start, int end) {
+        this(type, finding, ruleName, url, evidenceId, start, end, "INFO", "");
     }
 
     public Finding(String type, String finding, String ruleName, String url,
-                   HttpRequestResponse requestResponse, int start, int end, String severity) {
-        this(type, finding, ruleName, url, requestResponse, start, end, severity, "");
+                   String evidenceId, int start, int end, String severity) {
+        this(type, finding, ruleName, url, evidenceId, start, end, severity, "");
     }
 
     public Finding(String type, String finding, String ruleName, String url,
-                   HttpRequestResponse requestResponse, int start, int end,
+                   String evidenceId, int start, int end,
                    String severity, String context) {
         this.type            = type;
         this.finding         = finding;
         this.ruleName        = ruleName;
         this.url             = url;
-        this.requestResponse = requestResponse;
+        this.evidenceId      = evidenceId;
         this.start           = start;
         this.end             = end;
         this.severity        = severity != null ? severity : "INFO";
         this.context         = context != null ? context : "";
         this.timestamp       = System.currentTimeMillis();
 
-        if (requestResponse != null) {
-            if (requestResponse.request() != null) {
-                this.requestString = trimForPersistence(requestResponse.request().toString(), MAX_PERSISTED_REQUEST_CHARS);
-            }
-            if (requestResponse.response() != null) {
-                this.responseString = trimForPersistence(requestResponse.response().toString(), MAX_PERSISTED_RESPONSE_CHARS);
-            }
-        }
     }
 
     public String getType()             { return type; }
@@ -61,9 +48,7 @@ public class Finding {
     public String getUrl()              { return url; }
     public String getSeverity()         { return severity != null ? severity : "INFO"; }
     public String getContext()          { return context != null ? context : ""; }
-    public HttpRequestResponse getRequestResponse() { return requestResponse; }
-    public String getRequestString()    { return requestString; }
-    public String getResponseString()   { return responseString; }
+    public String getEvidenceId()       { return evidenceId; }
     public int getStart()               { return start; }
     public int getEnd()                 { return end; }
     public long getTimestamp()          { return timestamp; }
@@ -102,8 +87,4 @@ public class Finding {
         return Objects.hash(getUniqueKey());
     }
 
-    private static String trimForPersistence(String value, int maxChars) {
-        if (value == null || maxChars <= 0) return null;
-        return value.length() <= maxChars ? value : null;
-    }
 }

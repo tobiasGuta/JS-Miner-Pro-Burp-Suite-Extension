@@ -4,6 +4,7 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.persistence.PersistedObject;
 import com.burp.custom.JsMinerExtension;
 import com.burp.custom.model.RegexRule;
+import com.burp.custom.model.EntropyPolicy;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
@@ -34,6 +35,10 @@ public class ConfigTab extends JPanel {
     private JTextArea noiseDomainsTextArea;
     private JTextArea modulePrefixesTextArea;
     private JTextField maxFileSizeField;
+    private JTextField globalFindingLimitField;
+    private JTextField perHostFindingLimitField;
+    private JCheckBox persistRawHttpCheckbox;
+    private JCheckBox clearFindingsOnCloseCheckbox;
     private JComboBox<String> logLevelCombo;
     private JsMinerExtension extension;
     private JLabel regexValidationLabel;
@@ -42,8 +47,7 @@ public class ConfigTab extends JPanel {
     // Users can add "text/html" manually if they want to scan HTML pages too.
     private static final String DEFAULT_MIME_TYPES =
         "script\napplication/javascript\napplication/x-javascript\ntext/javascript\n" +
-        "application/json\napplication/xml\ntext/plain\napplication/wasm\n" +
-        "application/x-typescript\nsourcemap\napplication/octet-stream";
+        "application/json\napplication/xml\ntext/plain\napplication/x-typescript\nsourcemap";
 
     private static final String DEFAULT_NOISE_PATTERNS =
         "^\\.?\\.?/\n^[a-z]{2}(-[a-z]{2})?\\.js$\n\\.xml$\n^webpack\n^_ngcontent\n" +
@@ -130,6 +134,29 @@ public class ConfigTab extends JPanel {
         grid.add(maxFileSizeField, gbc);
 
         gbc.gridx = 0; gbc.gridy = 2;
+        grid.add(new JLabel("Global Finding Limit:"), gbc);
+        gbc.gridx = 1;
+        globalFindingLimitField = new JTextField("1000", 8);
+        globalFindingLimitField.setToolTipText("Maximum retained findings across the project.");
+        grid.add(globalFindingLimitField, gbc);
+
+        gbc.gridx = 0; gbc.gridy = 3;
+        grid.add(new JLabel("Per-Host Finding Limit:"), gbc);
+        gbc.gridx = 1;
+        perHostFindingLimitField = new JTextField("100", 8);
+        perHostFindingLimitField.setToolTipText("Maximum retained findings for one host.");
+        grid.add(perHostFindingLimitField, gbc);
+
+        gbc.gridx = 0; gbc.gridy = 4; gbc.gridwidth = 2;
+        persistRawHttpCheckbox = new JCheckBox("Persist raw HTTP evidence (may contain plaintext secrets)", true);
+        grid.add(persistRawHttpCheckbox, gbc);
+
+        gbc.gridx = 0; gbc.gridy = 5;
+        clearFindingsOnCloseCheckbox = new JCheckBox("Clear persisted findings when the project closes", false);
+        grid.add(clearFindingsOnCloseCheckbox, gbc);
+
+        gbc.gridwidth = 1;
+        gbc.gridx = 0; gbc.gridy = 6;
         grid.add(new JLabel("Log Level:"), gbc);
         gbc.gridx = 1;
         logLevelCombo = new JComboBox<>(new String[]{"DEBUG", "INFO", "WARN", "ERROR"});
@@ -191,7 +218,7 @@ public class ConfigTab extends JPanel {
         JPanel panel = new JPanel(new BorderLayout(5, 5));
         panel.setBorder(BorderFactory.createEmptyBorder(5, 5, 5, 5));
 
-        String[] columnNames = {"Active", "Name", "Regex", "Type", "Severity"};
+        String[] columnNames = {"Active", "Name", "Regex", "Type", "Severity", "Entropy Policy"};
         tableModel = new DefaultTableModel(columnNames, 0) {
             @Override public Class<?> getColumnClass(int col) { return col == 0 ? Boolean.class : String.class; }
             @Override public boolean isCellEditable(int r, int c) { return true; }
@@ -202,6 +229,8 @@ public class ConfigTab extends JPanel {
 
         JComboBox<String> severityCombo = new JComboBox<>(new String[]{"HIGH", "MEDIUM", "LOW", "INFO"});
         table.getColumnModel().getColumn(4).setCellEditor(new DefaultCellEditor(severityCombo));
+        JComboBox<EntropyPolicy> entropyPolicyCombo = new JComboBox<>(EntropyPolicy.values());
+        table.getColumnModel().getColumn(5).setCellEditor(new DefaultCellEditor(entropyPolicyCombo));
         JComboBox<String> typeCombo = new JComboBox<>(new String[]{"SECRET", "URL", "ENDPOINT", "FILE", "INFO", "GENERIC"});
         table.getColumnModel().getColumn(3).setCellEditor(new DefaultCellEditor(typeCombo));
 
@@ -235,7 +264,7 @@ public class ConfigTab extends JPanel {
         JButton downBtn     = new JButton("Move Down");
 
         addBtn.addActionListener(e -> {
-            tableModel.addRow(new Object[]{true, "New Rule", "", "GENERIC", "INFO"});
+            tableModel.addRow(new Object[]{true, "New Rule", "", "GENERIC", "INFO", EntropyPolicy.NONE});
             table.setRowSelectionInterval(tableModel.getRowCount() - 1, tableModel.getRowCount() - 1);
         });
         deleteBtn.addActionListener(e -> {
@@ -289,6 +318,21 @@ public class ConfigTab extends JPanel {
         catch (NumberFormatException e) { return DEFAULT_MAX_FILE_SIZE_MB; }
     }
 
+    private int getPositiveInt(JTextField field, int fallback) {
+        try { return Math.max(1, Integer.parseInt(field.getText())); }
+        catch (NumberFormatException e) { return fallback; }
+    }
+
+    /** Called after configuration initialization and from the Save & Apply UI action. */
+    public void applyScannerConfig() {
+        if (extension == null) return;
+        extension.updateScannerConfig(inScopeOnlyCheckbox.isSelected(), getMaxFileSizeMb(), getMimeTypes(),
+            getNoisePatterns(), getNoiseDomains(), getModulePrefixes(), getRules());
+        extension.updateFindingRetentionOptions(getPositiveInt(globalFindingLimitField, 1_000),
+            getPositiveInt(perHostFindingLimitField, 100), persistRawHttpCheckbox.isSelected(),
+            clearFindingsOnCloseCheckbox.isSelected());
+    }
+
     // -------------------------------------------------------------------------
     // Validation / helpers
     // -------------------------------------------------------------------------
@@ -329,7 +373,8 @@ public class ConfigTab extends JPanel {
             String  regex    = (String)  tableModel.getValueAt(i, 2);
             String  type     = (String)  tableModel.getValueAt(i, 3);
             String  severity = (String)  tableModel.getValueAt(i, 4);
-            newRules.add(new RegexRule(active, name, regex, type, severity));
+            EntropyPolicy entropyPolicy = (EntropyPolicy) tableModel.getValueAt(i, 5);
+            newRules.add(new RegexRule(active, name, regex, type, severity, entropyPolicy));
         }
         synchronized (this) { this.rules = newRules; }
     }
@@ -338,7 +383,7 @@ public class ConfigTab extends JPanel {
         tableModel.setRowCount(0);
         synchronized (this) {
             for (RegexRule rule : rules) {
-                tableModel.addRow(new Object[]{rule.isActive(), rule.getName(), rule.getRegex(), rule.getType(), rule.getSeverity()});
+                tableModel.addRow(new Object[]{rule.isActive(), rule.getName(), rule.getRegex(), rule.getType(), rule.getSeverity(), rule.getEntropyPolicy()});
             }
         }
     }
@@ -402,6 +447,10 @@ public class ConfigTab extends JPanel {
         prefs.setString("jsminer_noise_domains",    noiseDomainsTextArea.getText());
         prefs.setString("jsminer_module_prefixes",  modulePrefixesTextArea.getText());
         prefs.setString("jsminer_log_level",        (String) logLevelCombo.getSelectedItem());
+        prefs.setString("jsminer_global_finding_limit", globalFindingLimitField.getText());
+        prefs.setString("jsminer_per_host_finding_limit", perHostFindingLimitField.getText());
+        prefs.setBoolean("jsminer_persist_raw_http", persistRawHttpCheckbox.isSelected());
+        prefs.setBoolean("jsminer_clear_findings_on_close", clearFindingsOnCloseCheckbox.isSelected());
         try {
             Double.parseDouble(maxFileSizeField.getText());
             prefs.setString("jsminer_max_file_size", maxFileSizeField.getText());
@@ -409,7 +458,7 @@ public class ConfigTab extends JPanel {
             prefs.setString("jsminer_max_file_size", String.valueOf(DEFAULT_MAX_FILE_SIZE_MB));
         }
         if (extension != null) {
-            extension.updateNoisePatterns();
+            applyScannerConfig();
             extension.setLogLevel(JsMinerExtension.LogLevel.valueOf((String) logLevelCombo.getSelectedItem()));
         }
     }
@@ -450,6 +499,15 @@ public class ConfigTab extends JPanel {
             String maxFileSize = prefs.getString("jsminer_max_file_size");
             maxFileSizeField.setText(maxFileSize != null ? maxFileSize : String.valueOf(DEFAULT_MAX_FILE_SIZE_MB));
 
+            String globalLimit = prefs.getString("jsminer_global_finding_limit");
+            globalFindingLimitField.setText(globalLimit != null ? globalLimit : "1000");
+            String perHostLimit = prefs.getString("jsminer_per_host_finding_limit");
+            perHostFindingLimitField.setText(perHostLimit != null ? perHostLimit : "100");
+            Boolean persistRawHttp = prefs.getBoolean("jsminer_persist_raw_http");
+            persistRawHttpCheckbox.setSelected(persistRawHttp == null || persistRawHttp);
+            Boolean clearOnClose = prefs.getBoolean("jsminer_clear_findings_on_close");
+            clearFindingsOnCloseCheckbox.setSelected(clearOnClose != null && clearOnClose);
+
             String logLevel = prefs.getString("jsminer_log_level");
             logLevelCombo.setSelectedItem(logLevel != null ? logLevel : "INFO");
 
@@ -468,6 +526,10 @@ public class ConfigTab extends JPanel {
         modulePrefixesTextArea.setText(DEFAULT_MODULE_PREFIXES);
         inScopeOnlyCheckbox.setSelected(true);
         maxFileSizeField.setText(String.valueOf(DEFAULT_MAX_FILE_SIZE_MB));
+        globalFindingLimitField.setText("1000");
+        perHostFindingLimitField.setText("100");
+        persistRawHttpCheckbox.setSelected(true);
+        clearFindingsOnCloseCheckbox.setSelected(false);
         logLevelCombo.setSelectedItem("INFO");
         refreshTable();
         saveConfig();
@@ -532,7 +594,7 @@ public class ConfigTab extends JPanel {
         // ==================== AUTHENTICATION TOKENS ====================
         // JWT — context-anchored to avoid matching base64 image data
         r.add(new RegexRule(true, "JWT Token",
-            "(?<![A-Za-z0-9+/])(eyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,})(?![A-Za-z0-9+/])",
+            "(?:^|[^A-Za-z0-9+/])(eyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,})(?:$|[^A-Za-z0-9+/])",
             "SECRET", "HIGH"));
         r.add(new RegexRule(true, "Bearer Token",               "(?i)bearer\\s+([a-zA-Z0-9_\\-\\.=]{20,})", "SECRET", "HIGH"));
         r.add(new RegexRule(true, "OAuth Access Token",         "(?i)access_token['\"]?\\s*[:=]\\s*['\"]([a-zA-Z0-9_\\-\\.]{20,})['\"]", "SECRET", "HIGH"));
@@ -556,23 +618,23 @@ public class ConfigTab extends JPanel {
         r.add(new RegexRule(true, "Mixpanel Token",             "(?i)mixpanel.{0,20}['\"]([a-f0-9]{32})['\"]", "SECRET", "MEDIUM"));
 
         // ==================== HARDCODED CREDENTIALS ====================
-        // Anchored with negative lookahead to avoid placeholder strings like
-        // placeholder="Enter your password" or label="Current Password:"
+        // RE2J does not support lookbehind; noise filtering remains available
+        // for placeholder strings such as password labels and hints.
         r.add(new RegexRule(true, "Hardcoded Password",
-            "(?i)(?<!placeholder)(?<!label)(?<!aria-label)(?<!hint)['\"]?password['\"]?\\s*[:=]\\s*['\"]([^'\"\\s]{4,})['\"]",
+            "(?i)['\"]?password['\"]?\\s*[:=]\\s*['\"]([^'\"\\s]{4,})['\"]",
             "SECRET", "HIGH"));
         r.add(new RegexRule(true, "Hardcoded Secret",
-            "(?i)(?<!placeholder)['\"]?secret['\"]?\\s*[:=]\\s*['\"]([^'\"\\s]{8,})['\"]",
+            "(?i)['\"]?secret['\"]?\\s*[:=]\\s*['\"]([^'\"\\s]{8,})['\"]",
             "SECRET", "HIGH"));
         r.add(new RegexRule(true, "Generic API Key",
             "(?i)['\"]?api[_-]?key['\"]?\\s*[:=]\\s*['\"]([a-zA-Z0-9_\\-]{20,})['\"]",
-            "SECRET", "MEDIUM"));
+            "SECRET", "MEDIUM", EntropyPolicy.REQUIRE_MINIMUM));
         r.add(new RegexRule(true, "Generic Auth Token",
             "(?i)['\"]?auth[_-]?token['\"]?\\s*[:=]\\s*['\"]([a-zA-Z0-9_\\-\\.]{20,})['\"]",
-            "SECRET", "HIGH"));
+            "SECRET", "HIGH", EntropyPolicy.REQUIRE_MINIMUM));
         r.add(new RegexRule(true, "Base64 Credentials",
             "(?i)credentials?['\"]?\\s*[:=]\\s*['\"]((?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?)['\"]",
-            "SECRET", "MEDIUM"));
+            "SECRET", "MEDIUM", EntropyPolicy.REQUIRE_MINIMUM));
 
         // ==================== INTERNAL INFRASTRUCTURE ====================
         r.add(new RegexRule(true, "Private IP (10.x)",          "(\\b10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b)", "INFO", "MEDIUM"));

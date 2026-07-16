@@ -2,7 +2,7 @@ JS Miner Pro - Burp Suite Extension
 ===================================
 ![Java](https://img.shields.io/badge/Java-17+-ED8B00?style=for-the-badge&logo=java&logoColor=white) ![Burp Suite](https://img.shields.io/badge/Burp_Suite-FF6633?style=for-the-badge&logo=burpsuite&logoColor=white) ![Security](https://img.shields.io/badge/Cybersecurity-Bug_Bounty-red?style=for-the-badge)
 
-**JS Miner Pro** is a powerful, customizable Burp Suite extension designed to find hard-coded secrets, API endpoints, and hidden paths inside JavaScript, JSON, and HTML files.
+**JS Miner Pro** is a powerful, customizable Burp Suite extension designed to find hard-coded secrets, API endpoints, and hidden paths inside JavaScript and JSON files.
 
 Built using the modern **Montoya API**, it is optimized for Bug Hunters who need to dig deep into client-side code without the performance overhead of heavy scanners.
 
@@ -16,7 +16,7 @@ Most passive scanners rely on Burp's default scanning scheduler, which often ski
 ### Key Features
 
 #### Core Scanning
--   **Deep Traffic Inspection**: Scans all traffic (JS, HTML, JSON) for sensitive data
+-   **Deep Traffic Inspection**: Scans configured JavaScript and JSON traffic for sensitive data
 -   **Proxy History Scanning**: One-click button to scan all existing items in your Proxy HTTP History
 -   **Zero-Latency**: Optimized to ignore heavy media files (images, fonts) to keep your proxy fast
 -   **Smart MIME Detection**: Multiple detection methods (inferredMimeType, Content-Type header, URL extension)
@@ -50,7 +50,7 @@ Most passive scanners rely on Burp's default scanning scheduler, which often ski
 
 #### Data Management
 -   **Persistent Settings**: Custom regex rules and findings saved automatically
--   **Auto-Save**: Findings saved on a configurable interval (default: 60 seconds)
+-   **Auto-Save**: Findings saved every five minutes
 -   **Export Options**: Export findings as JSON or CSV
 -   **Smart UI**: Split-view interface with auto-highlighting. Click a finding to see where it is in the response
 
@@ -86,7 +86,7 @@ If you want to modify the code or build it yourself, follow these steps. You nee
 
     ```bash
     git clone https://github.com/tobiasGuta/JS-Miner-Pro-Burp-Suite-Extension.git
-    cd JS-Miner-Pro-Burp-Suite-Extension/JsMinerPro
+    cd JS-Miner-Pro-Burp-Suite-Extension
     ```
 
 2.  Build the "Fat JAR" (includes dependencies) using Gradle:
@@ -178,8 +178,8 @@ Technical Details
 -----------------
 
 - **Thread Pool**: Bounded queue (1000) with 4 worker threads for efficient parallel scanning
-- **Regex Timeout**: 5-second timeout per regex match to prevent ReDoS
-- **Auto-Save**: Findings persisted every 60 seconds to prevent data loss
+- **ReDoS-safe regex engine**: All scanning and noise rules use RE2J's linear-time engine; Java-only backreferences and lookarounds are rejected when rules are saved or imported
+- **Auto-Save**: Findings persisted every five minutes to prevent data loss
 - **MIME Filtering**: Skips images, fonts, PDFs, videos, and other binary content
 
 License

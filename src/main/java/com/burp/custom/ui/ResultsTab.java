@@ -9,6 +9,7 @@ import burp.api.montoya.ui.editor.EditorOptions;
 import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
 import com.burp.custom.JsMinerExtension;
+import com.burp.custom.model.EvidenceRecord;
 import com.burp.custom.model.Finding;
 import com.burp.custom.util.EntropyAnalyzer;
 import com.google.gson.Gson;
@@ -27,6 +28,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.lang.reflect.Type;
 import java.text.SimpleDateFormat;
+import java.net.URI;
 import java.util.*;
 import java.util.List;
 
@@ -40,6 +42,7 @@ public class ResultsTab extends JPanel {
     private final HttpResponseEditor responseEditor;
     private final Gson gson;
     private final Object findingsLock = new Object();
+    private volatile StatsTab statsTab;
 
     private final List<Finding> findingsList = new ArrayList<>();
     // URL-scoped dedup — same secret on same URL is one finding
@@ -48,8 +51,12 @@ public class ResultsTab extends JPanel {
     private final Map<String, Set<String>> secretToUrls = new LinkedHashMap<>();
     // Map from finding value to table row indices for O(1) reuse-count updates
     private final Map<String, List<Integer>> findingToRows = new HashMap<>();
+    private final Map<String, EvidenceRecord> evidenceById = new HashMap<>();
 
-    private static final String FINDINGS_KEY = "jsminer_findings_v2";
+    private static final String FINDINGS_KEY = "jsminer_findings_v3";
+    private volatile int globalFindingLimit = 1_000;
+    private volatile int perHostFindingLimit = 100;
+    private volatile boolean persistRawHttp = true;
 
     private JComboBox<String> severityFilter;
     private JComboBox<String> typeFilter;
@@ -208,12 +215,10 @@ public class ResultsTab extends JPanel {
         scanBtn.addActionListener(e -> {
             scanBtn.setEnabled(false);
             scanBtn.setText("Scanning...");
-            extension.scanProxyHistory();
-            new javax.swing.Timer(2000, evt -> {
+            extension.scanProxyHistory(() -> {
                 scanBtn.setEnabled(true);
                 scanBtn.setText("Scan Proxy History");
-                ((javax.swing.Timer) evt.getSource()).stop();
-            }).start();
+            });
         });
 
         JButton clearBtn      = new JButton("Clear Results");
@@ -261,40 +266,55 @@ public class ResultsTab extends JPanel {
     // Adding findings
     // -------------------------------------------------------------------------
 
-    public void addFinding(String type, String finding, String ruleName, String url,
-                           HttpRequestResponse reqResp, int start, int end,
-                           String severity, String context) {
-
-        Finding newFinding = new Finding(type, finding, ruleName, url, reqResp, start, end, severity, context);
-        String urlKey = newFinding.getUrlScopedKey();
-        EntropyAnalyzer.EntropyResult entropyResult = EntropyAnalyzer.analyze(finding);
-        String entropyLevel = entropyResult.level;
-        final int reuseCount;
-
-        synchronized (findingsLock) {
-            if (!uniqueUrlScopedKeys.add(urlKey)) return;
-            secretToUrls.computeIfAbsent(finding, k -> new LinkedHashSet<>()).add(url);
-            reuseCount = secretToUrls.get(finding).size();
-        }
-
+    public void addFindingsBatch(List<FindingCandidate> candidates) {
+        if (candidates.isEmpty()) return;
         SwingUtilities.invokeLater(() -> {
+            boolean changed = false;
             synchronized (findingsLock) {
-                int newRow = findingsList.size();
-                findingsList.add(newFinding);
-                tableModel.addRow(new Object[]{
-                    severity, type, finding, ruleName,
-                    entropyLevel, String.valueOf(reuseCount), context, url
-                });
-                findingToRows.computeIfAbsent(finding, k -> new ArrayList<>()).add(newRow);
-                if (reuseCount > 1) {
-                    List<Integer> rows = findingToRows.get(finding);
-                    for (int rowIdx : rows) {
-                        tableModel.setValueAt(String.valueOf(reuseCount), rowIdx, COL_REUSE);
+                for (FindingCandidate candidate : candidates) {
+                    String urlKey = candidate.url() + "::" + candidate.type() + "::" + candidate.finding();
+                    if (!uniqueUrlScopedKeys.add(urlKey)) continue;
+                    if (findingsList.size() >= globalFindingLimit || hostFindingCountLocked(candidate.url()) >= perHostFindingLimit) {
+                        uniqueUrlScopedKeys.remove(urlKey);
+                        continue;
                     }
+
+                    EvidenceRecord evidence = evidenceById.get(candidate.evidenceId());
+                    if (evidence == null) {
+                        evidence = new EvidenceRecord(candidate.url(), candidate.requestResponse(), candidate.evidenceId());
+                        evidenceById.put(candidate.evidenceId(), evidence);
+                    }
+                    Finding finding = new Finding(candidate.type(), candidate.finding(), candidate.ruleName(), candidate.url(),
+                        evidence.getId(), candidate.start(), candidate.end(), candidate.severity(), candidate.context());
+                    findingsList.add(finding);
+                    secretToUrls.computeIfAbsent(candidate.finding(), ignored -> new LinkedHashSet<>()).add(candidate.url());
+                    findingToRows.computeIfAbsent(candidate.finding(), ignored -> new ArrayList<>()).add(findingsList.size() - 1);
+                    EntropyAnalyzer.EntropyResult entropy = EntropyAnalyzer.analyze(candidate.finding());
+                    tableModel.addRow(new Object[]{candidate.severity(), candidate.type(), candidate.finding(), candidate.ruleName(),
+                        entropy.level, String.valueOf(secretToUrls.get(candidate.finding()).size()), candidate.context(), candidate.url()});
+                    changed = true;
                 }
-                statsLabel.setText(findingsList.size() + " finding" + (findingsList.size() == 1 ? "" : "s"));
+                if (changed) {
+                    refreshReuseCountsLocked();
+                    statsLabel.setText(findingsList.size() + " finding" + (findingsList.size() == 1 ? "" : "s"));
+                }
             }
+            if (changed) synchronizeStats();
         });
+    }
+
+    public record FindingCandidate(String type, String finding, String ruleName, String url, String evidenceId,
+                                   HttpRequestResponse requestResponse, int start, int end, String severity, String context) { }
+
+    public void setStatsTab(StatsTab statsTab) {
+        this.statsTab = statsTab;
+        synchronizeStats();
+    }
+
+    public void setRetentionOptions(int globalLimit, int perHostLimit, boolean persistRawHttp) {
+        this.globalFindingLimit = Math.max(1, globalLimit);
+        this.perHostFindingLimit = Math.max(1, perHostLimit);
+        this.persistRawHttp = persistRawHttp;
     }
 
     // -------------------------------------------------------------------------
@@ -302,23 +322,11 @@ public class ResultsTab extends JPanel {
     // -------------------------------------------------------------------------
 
     private void displayFinding(Finding finding) {
-        if (finding.getRequestResponse() != null) {
-            requestEditor.setRequest(finding.getRequestResponse().request());
-            responseEditor.setResponse(finding.getRequestResponse().response());
-        } else {
-            try {
-                requestEditor.setRequest(finding.getRequestString() != null
-                    ? HttpRequest.httpRequest(finding.getRequestString()) : null);
-            } catch (Exception e) {
-                requestEditor.setRequest(null);
-            }
-            try {
-                responseEditor.setResponse(finding.getResponseString() != null
-                    ? HttpResponse.httpResponse(finding.getResponseString()) : null);
-            } catch (Exception e) {
-                responseEditor.setResponse(null);
-            }
-        }
+        EvidenceRecord evidence = evidenceFor(finding);
+        try { requestEditor.setRequest(evidence != null ? evidence.getRequest() : null); }
+        catch (Exception e) { requestEditor.setRequest(null); }
+        try { responseEditor.setResponse(evidence != null ? evidence.getResponse() : null); }
+        catch (Exception e) { responseEditor.setResponse(null); }
         if (responseEditor.getResponse() != null) {
             responseEditor.setSearchExpression(finding.getFinding());
         }
@@ -377,21 +385,20 @@ public class ResultsTab extends JPanel {
     private void sendToTool(String tool) {
         Finding f = getSelectedFinding();
         if (f == null) return;
-        HttpRequest req = null;
-        if (f.getRequestResponse() != null) req = f.getRequestResponse().request();
-        else if (f.getRequestString() != null) req = HttpRequest.httpRequest(f.getRequestString());
+        EvidenceRecord evidence = evidenceFor(f);
+        HttpRequest req = evidence != null ? evidence.getRequest() : null;
         if (req == null) return;
 
         switch (tool) {
             case "repeater":  api.repeater().sendToRepeater(req, "JS Miner: " + f.getRuleName()); break;
             case "intruder":  api.intruder().sendToIntruder(req); break;
             case "organizer":
-                if (f.getRequestResponse() != null) {
-                    api.organizer().sendToOrganizer(f.getRequestResponse());
-                } else if (f.getRequestString() != null && f.getResponseString() != null) {
+                if (evidence != null && evidence.getRequestResponse() != null) {
+                    api.organizer().sendToOrganizer(evidence.getRequestResponse());
+                } else if (evidence != null && evidence.getRequestString() != null && evidence.getResponseString() != null) {
                     api.organizer().sendToOrganizer(HttpRequestResponse.httpRequestResponse(
-                        HttpRequest.httpRequest(f.getRequestString()),
-                        HttpResponse.httpResponse(f.getResponseString())));
+                        HttpRequest.httpRequest(evidence.getRequestString()),
+                        HttpResponse.httpResponse(evidence.getResponseString())));
                 }
                 break;
         }
@@ -409,6 +416,7 @@ public class ResultsTab extends JPanel {
                 statsLabel.setText(findingsList.size() + " finding" + (findingsList.size() == 1 ? "" : "s"));
             }
         }
+        synchronizeStats();
     }
 
     // -------------------------------------------------------------------------
@@ -504,7 +512,9 @@ public class ResultsTab extends JPanel {
 
     private String csv(String v) {
         if (v == null) return "";
-        return v.replace("\"", "\"\"").replace("\n", " ").replace("\r", "");
+        String sanitized = v.replace("\"", "\"\"").replace("\n", " ").replace("\r", "");
+        if (!sanitized.isEmpty() && "=+-@".indexOf(sanitized.charAt(0)) >= 0) return "'" + sanitized;
+        return sanitized;
     }
 
     // -------------------------------------------------------------------------
@@ -516,10 +526,13 @@ public class ResultsTab extends JPanel {
     private void saveFindings() {
         try {
             List<Finding> snapshot;
+            List<EvidenceRecord> evidenceSnapshot;
             synchronized (findingsLock) {
                 snapshot = new ArrayList<>(findingsList);
+                evidenceSnapshot = evidenceById.values().stream()
+                    .map(evidence -> evidence.forPersistence(persistRawHttp)).collect(java.util.stream.Collectors.toList());
             }
-            api.persistence().extensionData().setString(FINDINGS_KEY, gson.toJson(snapshot));
+            api.persistence().extensionData().setString(FINDINGS_KEY, gson.toJson(new PersistedFindings(snapshot, evidenceSnapshot)));
         } catch (Exception e) {
             extension.log(JsMinerExtension.LogLevel.ERROR, "Failed to save findings: " + e.getMessage());
         }
@@ -529,14 +542,25 @@ public class ResultsTab extends JPanel {
         try {
             PersistedObject prefs = api.persistence().extensionData();
             String json = prefs.getString(FINDINGS_KEY);
-            if (json == null || json.isEmpty()) return;
-
-            Type listType = new TypeToken<ArrayList<Finding>>(){}.getType();
-            List<Finding> loaded = gson.fromJson(json, listType);
-            if (loaded == null) return;
+            PersistedFindings persisted;
+            if (json == null || json.isEmpty()) {
+                String legacyJson = prefs.getString("jsminer_findings_v2");
+                if (legacyJson == null || legacyJson.isEmpty()) return;
+                Type listType = new TypeToken<ArrayList<Finding>>(){}.getType();
+                List<Finding> legacyFindings = gson.fromJson(legacyJson, listType);
+                persisted = new PersistedFindings(legacyFindings, List.of());
+            } else {
+                persisted = gson.fromJson(json, PersistedFindings.class);
+            }
+            if (persisted == null || persisted.findings == null) return;
 
             synchronized (findingsLock) {
-                for (Finding f : loaded) {
+                if (persisted.evidence != null) {
+                    for (EvidenceRecord evidence : persisted.evidence) {
+                        if (evidence != null && evidence.getId() != null) evidenceById.put(evidence.getId(), evidence);
+                    }
+                }
+                for (Finding f : persisted.findings) {
                     if (!uniqueUrlScopedKeys.add(f.getUrlScopedKey())) continue;
                     findingsList.add(f);
                     EntropyAnalyzer.EntropyResult er = EntropyAnalyzer.analyze(f.getFinding());
@@ -566,6 +590,8 @@ public class ResultsTab extends JPanel {
                 }
             });
 
+            synchronizeStats();
+
         } catch (Exception e) {
             extension.log(JsMinerExtension.LogLevel.WARN, "Failed to load findings: " + e.getMessage());
             api.persistence().extensionData().deleteString(FINDINGS_KEY);
@@ -580,12 +606,24 @@ public class ResultsTab extends JPanel {
                 uniqueUrlScopedKeys.clear();
                 secretToUrls.clear();
                 findingToRows.clear();
+                evidenceById.clear();
             }
             requestEditor.setRequest(null);
             responseEditor.setResponse(null);
             api.persistence().extensionData().deleteString(FINDINGS_KEY);
             statsLabel.setText("0 findings");
+            synchronizeStats();
         });
+    }
+
+    private void synchronizeStats() {
+        StatsTab currentStatsTab = statsTab;
+        if (currentStatsTab == null) return;
+        List<Finding> snapshot;
+        synchronized (findingsLock) {
+            snapshot = new ArrayList<>(findingsList);
+        }
+        currentStatsTab.replaceFindings(snapshot);
     }
 
     // -------------------------------------------------------------------------
@@ -616,11 +654,47 @@ public class ResultsTab extends JPanel {
             findingToRows.computeIfAbsent(finding.getFinding(), k -> new ArrayList<>()).add(idx);
         }
 
+        evidenceById.keySet().retainAll(findingsList.stream().map(Finding::getEvidenceId)
+            .filter(Objects::nonNull).collect(java.util.stream.Collectors.toSet()));
+
+        refreshReuseCountsLocked();
+    }
+
+    private void refreshReuseCountsLocked() {
         for (Map.Entry<String, List<Integer>> entry : findingToRows.entrySet()) {
             int reuseCount = secretToUrls.getOrDefault(entry.getKey(), Collections.emptySet()).size();
             for (int rowIdx : entry.getValue()) {
                 tableModel.setValueAt(String.valueOf(reuseCount), rowIdx, COL_REUSE);
             }
+        }
+    }
+
+    public void clearPersistedFindings() {
+        api.persistence().extensionData().deleteString(FINDINGS_KEY);
+    }
+
+    private EvidenceRecord evidenceFor(Finding finding) {
+        synchronized (findingsLock) { return evidenceById.get(finding.getEvidenceId()); }
+    }
+
+    private int hostFindingCountLocked(String url) {
+        String host = hostFor(url);
+        int count = 0;
+        for (Finding finding : findingsList) if (host.equals(hostFor(finding.getUrl()))) count++;
+        return count;
+    }
+
+    private String hostFor(String url) {
+        try { return new URI(url).getHost() != null ? new URI(url).getHost() : url; }
+        catch (Exception ignored) { return url; }
+    }
+
+    private static class PersistedFindings {
+        List<Finding> findings;
+        List<EvidenceRecord> evidence;
+        PersistedFindings(List<Finding> findings, List<EvidenceRecord> evidence) {
+            this.findings = findings;
+            this.evidence = evidence;
         }
     }
 }

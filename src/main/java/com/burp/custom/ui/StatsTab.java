@@ -1,6 +1,7 @@
 package com.burp.custom.ui;
 
 import burp.api.montoya.MontoyaApi;
+import com.burp.custom.model.Finding;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
@@ -69,10 +70,6 @@ public class StatsTab extends JPanel {
         JPanel btnPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
         btnPanel.add(refreshBtn);
 
-        JButton clearBtn = new JButton("Clear Stats");
-        clearBtn.addActionListener(e -> clearStats());
-        btnPanel.add(clearBtn);
-
         add(btnPanel, BorderLayout.SOUTH);
     }
 
@@ -81,6 +78,27 @@ public class StatsTab extends JPanel {
      * then schedules a lightweight EDT update.
      */
     public void recordFinding(String url, String type, String severity) {
+        recordFinding(url, type, severity, true);
+    }
+
+    /** Rebuilds statistics from the current deduplicated Results set. */
+    public void replaceFindings(Collection<Finding> findings) {
+        Runnable replace = () -> {
+            stats.clear();
+            totalFindings.set(0);
+            totalHigh.set(0);
+            totalMedium.set(0);
+            totalLow.set(0);
+            for (Finding finding : findings) {
+                recordFinding(finding.getUrl(), finding.getType(), finding.getSeverity(), false);
+            }
+            refreshTable();
+        };
+        if (SwingUtilities.isEventDispatchThread()) replace.run();
+        else SwingUtilities.invokeLater(replace);
+    }
+
+    private void recordFinding(String url, String type, String severity, boolean refresh) {
         String host = extractHost(url);
 
         stats.computeIfAbsent(host, h -> new ConcurrentHashMap<>())
@@ -94,17 +112,7 @@ public class StatsTab extends JPanel {
             case "MEDIUM": totalMedium.incrementAndGet(); break;
             default:       totalLow.incrementAndGet();    break;
         }
-
-        scheduleRefresh();
-    }
-
-    public void clearStats() {
-        stats.clear();
-        totalFindings.set(0);
-        totalHigh.set(0);
-        totalMedium.set(0);
-        totalLow.set(0);
-        refreshNow();
+        if (refresh) scheduleRefresh();
     }
 
     private void refreshTable() {

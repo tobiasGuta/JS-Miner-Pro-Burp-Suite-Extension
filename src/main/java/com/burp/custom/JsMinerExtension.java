@@ -8,21 +8,25 @@ import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.responses.HttpResponse;
 import burp.api.montoya.proxy.ProxyHttpRequestResponse;
 import com.burp.custom.model.RegexRule;
+import com.burp.custom.model.EvidenceRecord;
+import com.burp.custom.model.EntropyPolicy;
 import com.burp.custom.ui.ConfigTab;
 import com.burp.custom.ui.ResultsTab;
 import com.burp.custom.ui.StatsTab;
 import com.burp.custom.util.EntropyAnalyzer;
+import com.google.re2j.Matcher;
+import com.google.re2j.Pattern;
 
 import javax.swing.*;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUnloadingHandler {
 
@@ -32,28 +36,34 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
     private StatsTab statsTab;
 
     // Thread-safe noise pattern storage — replaced atomically on config save
-    private final AtomicReference<List<Pattern>> noisePatterns = new AtomicReference<>(Collections.emptyList());
+    private final AtomicReference<ScannerConfig> activeConfig =
+        new AtomicReference<>(new ScannerConfig(true, 2_000_000L, List.of(), "", List.of(), List.of(), List.of(), List.of()));
 
     // Main analysis thread pool (background scanning)
     private ExecutorService executorService;
 
-    // SHARED timeout pool for regex matching — reused across all rule evaluations.
-    // Fixes the critical bug of creating a new ExecutorService per regex match.
-    private ExecutorService regexTimeoutPool;
-
     private ScheduledExecutorService autoSaveScheduler;
+    private volatile boolean clearFindingsOnProjectClose;
+    private final AtomicLong droppedResponses = new AtomicLong();
+    private final AtomicLong lastDropWarningMillis = new AtomicLong();
+    private final AtomicBoolean historyScanRunning = new AtomicBoolean();
+    private final Map<String, Boolean> responseDedupCache = Collections.synchronizedMap(
+        new LinkedHashMap<>(256, 0.75f, true) {
+            @Override protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) { return size() > 1_024; }
+        });
 
-    private static final long REGEX_TIMEOUT_MS = 3000;
     public static final int CONTEXT_WINDOW = 100;
     private static final int MAX_MATCHES_PER_RULE = 100;
     private static final int MAX_FINDINGS_PER_RESPONSE = 500;
-    private static final int REGEX_QUEUE_CAPACITY = 64;
-    private static final int RULE_TIMEOUT_SUSPEND_THRESHOLD = 2;
 
     public enum LogLevel { DEBUG, INFO, WARN, ERROR }
     private volatile LogLevel currentLogLevel = LogLevel.INFO;
-    private final Map<String, AtomicInteger> regexTimeoutCounts = new ConcurrentHashMap<>();
-    private final java.util.Set<String> suspendedRules = ConcurrentHashMap.newKeySet();
+
+    record CompiledRule(String name, String type, String severity, EntropyPolicy entropyPolicy, Pattern pattern) { }
+
+    record ScannerConfig(boolean scopeOnly, long maxBytes, List<String> mimeTypes, String rulesetVersion,
+                         List<Pattern> noisePatterns, List<String> noiseDomains,
+                         List<String> modulePrefixes, List<CompiledRule> rules) { }
 
     @Override
     public void initialize(MontoyaApi api) {
@@ -63,23 +73,15 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         configTab = new ConfigTab(api, this);
         resultsTab = new ResultsTab(api, this);
         statsTab   = new StatsTab(api);
+        resultsTab.setStatsTab(statsTab);
 
         BlockingQueue<Runnable> workQueue = new LinkedBlockingQueue<>(1000);
         this.executorService = new ThreadPoolExecutor(
             2, 4, 60L, TimeUnit.SECONDS, workQueue,
-            new ThreadPoolExecutor.DiscardOldestPolicy()
-        );
-
-        // Shared pool — eliminates per-match executor creation overhead
-        this.regexTimeoutPool = new ThreadPoolExecutor(
-            4, 4, 60L, TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(REGEX_QUEUE_CAPACITY),
-            r -> {
-                Thread t = new Thread(r, "jsminer-regex-worker");
-                t.setDaemon(true);
-                return t;
-            },
-            new ThreadPoolExecutor.AbortPolicy()
+            (task, executor) -> {
+                if (!executor.isShutdown()) recordDroppedResponse();
+                throw new RejectedExecutionException("Analysis queue full");
+            }
         );
 
         this.autoSaveScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -100,12 +102,18 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         api.http().registerHttpHandler(this);
         api.extension().registerUnloadingHandler(this);
 
-        updateNoisePatterns();
+        configTab.applyScannerConfig();
         log(LogLevel.INFO, "JS Miner Pro loaded successfully.");
     }
 
     public void setLogLevel(LogLevel level) { this.currentLogLevel = level; }
     public LogLevel getLogLevel()           { return currentLogLevel; }
+
+    public void updateFindingRetentionOptions(int globalLimit, int perHostLimit,
+                                              boolean persistRawHttp, boolean clearOnProjectClose) {
+        this.clearFindingsOnProjectClose = clearOnProjectClose;
+        if (resultsTab != null) resultsTab.setRetentionOptions(globalLimit, perHostLimit, persistRawHttp);
+    }
 
     public void log(LogLevel level, String message) {
         if (level.ordinal() >= currentLogLevel.ordinal()) {
@@ -119,30 +127,61 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
 
     // Atomically replaces the noise pattern list — background threads always
     // see either the old complete list or the new one, never a partial build.
-    public void updateNoisePatterns() {
-        List<Pattern> built = new ArrayList<>();
-        for (String s : configTab.getNoisePatterns()) {
-            if (s != null && !s.trim().isEmpty()) {
-                try {
-                    built.add(Pattern.compile(s.trim()));
-                } catch (Exception e) {
-                    log(LogLevel.WARN, "Invalid noise pattern skipped: " + s);
-                }
+    public void updateScannerConfig(boolean scopeOnly, double maxFileSizeMb, String[] mimeTypes,
+                                    String[] noisePatternStrings, List<String> noiseDomains,
+                                    List<String> modulePrefixes, List<RegexRule> rules) {
+        List<Pattern> noisePatterns = new ArrayList<>();
+        for (String value : noisePatternStrings) {
+            if (value == null || value.trim().isEmpty()) continue;
+            try {
+                noisePatterns.add(Pattern.compile(value.trim()));
+            } catch (Exception e) {
+                log(LogLevel.WARN, "Invalid noise pattern skipped: " + value);
             }
         }
-        noisePatterns.set(Collections.unmodifiableList(built));
+
+        List<CompiledRule> compiledRules = new ArrayList<>();
+        for (RegexRule rule : rules) {
+            if (!rule.isActive()) continue;
+            Pattern pattern = rule.getPattern();
+            if (pattern == null) {
+                log(LogLevel.WARN, "Invalid rule skipped: " + rule.getName() + " (" + rule.getPatternError() + ")");
+                continue;
+            }
+            compiledRules.add(new CompiledRule(rule.getName(), rule.getType(), rule.getSeverity(), rule.getEntropyPolicy(), pattern));
+        }
+
+        long maxBytes = Double.isFinite(maxFileSizeMb) && maxFileSizeMb >= 0
+            ? (long) (maxFileSizeMb * 1_000_000) : 2_000_000L;
+        String rulesetVersion = Integer.toHexString(compiledRules.hashCode());
+        activeConfig.set(new ScannerConfig(scopeOnly, maxBytes, normalize(mimeTypes), rulesetVersion, List.copyOf(noisePatterns),
+            List.copyOf(noiseDomains), List.copyOf(modulePrefixes), List.copyOf(compiledRules)));
     }
 
-    public List<String> getNoiseDomains()   { return configTab.getNoiseDomains(); }
-    public List<String> getModulePrefixes() { return configTab.getModulePrefixes(); }
+    private void recordDroppedResponse() {
+        long dropped = droppedResponses.incrementAndGet();
+        long now = System.currentTimeMillis();
+        long previous = lastDropWarningMillis.get();
+        if (now - previous >= 30_000 && lastDropWarningMillis.compareAndSet(previous, now)) {
+            log(LogLevel.WARN, "Analysis queue full; dropped " + dropped + " response task(s) so far.");
+        }
+    }
+
+    private List<String> normalize(String[] values) {
+        List<String> normalized = new ArrayList<>();
+        for (String value : values) {
+            if (value != null && !value.trim().isEmpty()) normalized.add(value.trim().toLowerCase());
+        }
+        return List.copyOf(normalized);
+    }
+
 
     // Single shared gate used by both live handler and proxy history scanner
-    private boolean shouldAnalyze(String url, HttpResponse response) {
-        if (configTab.isScopeOnly() && !api.scope().isInScope(url)) return false;
-        if (!isMimeTypeAllowed(response, url)) return false;
+    private boolean shouldAnalyze(String url, HttpResponse response, ScannerConfig config) {
+        if (config.scopeOnly() && !api.scope().isInScope(url)) return false;
+        if (!isMimeTypeAllowed(response, url, config)) return false;
         // Use byte length (not char length) to avoid chars-vs-bytes mismatch bug
-        long maxBytes = (long) (configTab.getMaxFileSizeMb() * 1_000_000);
-        if (response.body().length() > maxBytes) {
+        if (response.body().length() > config.maxBytes()) {
             log(LogLevel.DEBUG, "Skipping oversized file (" + response.body().length() + " bytes): " + url);
             return false;
         }
@@ -150,7 +189,18 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
     }
 
     public void scanProxyHistory() {
-        executorService.submit(() -> {
+        scanProxyHistory(() -> { });
+    }
+
+    public void scanProxyHistory(Runnable completion) {
+        if (!historyScanRunning.compareAndSet(false, true)) {
+            log(LogLevel.WARN, "Proxy history scan already running.");
+            SwingUtilities.invokeLater(completion);
+            return;
+        }
+        try {
+            executorService.submit(() -> {
+            try {
             log(LogLevel.INFO, "Starting proxy history scan...");
             List<ProxyHttpRequestResponse> history = api.proxy().history();
             int scanned = 0, matched = 0;
@@ -160,12 +210,15 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
                     if (item.finalRequest() == null || item.response() == null) continue;
                     String url = item.finalRequest().url();
                     HttpResponse response = item.response();
-                    if (!shouldAnalyze(url, response)) continue;
+                    ScannerConfig config = activeConfig.get();
+                    if (!shouldAnalyze(url, response, config)) continue;
                     String body = response.bodyToString();
                     if (body == null || body.isEmpty()) continue;
+                    if (!isMostlyPrintable(body)) continue;
+                    if (!shouldScanResponse(url, body, config)) continue;
                     scanned++;
                     HttpRequestResponse reqResp = HttpRequestResponse.httpRequestResponse(item.finalRequest(), response);
-                    if (analyzeContent(url, body, reqResp) > 0) matched++;
+                    if (analyzeContent(url, body, reqResp, config) > 0) matched++;
                 } catch (Exception e) {
                     log(LogLevel.DEBUG, "Error processing history item: " + e.getMessage());
                 }
@@ -178,22 +231,30 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
                     "Scan complete!\n\nScanned: " + fs + " items\nItems with matches: " + fm,
                     "Proxy History Scan", JOptionPane.INFORMATION_MESSAGE)
             );
+            } finally {
+                historyScanRunning.set(false);
+                SwingUtilities.invokeLater(completion);
+            }
         });
+        } catch (RejectedExecutionException e) {
+            historyScanRunning.set(false);
+            SwingUtilities.invokeLater(completion);
+        }
     }
 
-    private boolean isMimeTypeAllowed(HttpResponse response, String url) {
-        String[] allowedMimes = configTab.getMimeTypes();
+    private boolean isMimeTypeAllowed(HttpResponse response, String url, ScannerConfig config) {
+        List<String> allowedMimes = config.mimeTypes();
 
         String inferredMime = response.inferredMimeType().name().toLowerCase();
         for (String allowed : allowedMimes) {
-            if (inferredMime.contains(allowed.toLowerCase().trim())) return true;
+            if (inferredMime.contains(allowed)) return true;
         }
 
         String contentType = response.headerValue("Content-Type");
         if (contentType != null) {
             contentType = contentType.toLowerCase();
             for (String allowed : allowedMimes) {
-                if (contentType.contains(allowed.toLowerCase().trim())) return true;
+                if (contentType.contains(allowed)) return true;
             }
         }
 
@@ -206,57 +267,68 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
                urlLower.endsWith(".map");
     }
 
-    int analyzeContent(String url, String responseBody, HttpRequestResponse reqResp) {
-        int count = 0;
-        // getRules() returns a defensive copy — safe to iterate on background thread
-        List<RegexRule> rules = configTab.getRules();
+    private boolean isMostlyPrintable(String body) {
+        if (body.isEmpty()) return false;
+        int printable = 0;
+        int checked = Math.min(body.length(), 8_192);
+        for (int i = 0; i < checked; i++) {
+            char c = body.charAt(i);
+            if (Character.isWhitespace(c) || (c >= 0x20 && c != 0x7f)) printable++;
+        }
+        return printable >= checked * 0.85;
+    }
 
-        for (RegexRule rule : rules) {
-            if (!rule.isActive()) continue;
-            if (suspendedRules.contains(rule.getName())) continue;
-            Pattern pattern = rule.getPattern();
-            if (pattern == null) continue;
+    private boolean shouldScanResponse(String url, String body, ScannerConfig config) {
+        String canonicalUrl = url.split("\\?", 2)[0];
+        String key = canonicalUrl + "\n" + EvidenceRecord.responseHash(body) + "\n" + config.rulesetVersion();
+        synchronized (responseDedupCache) {
+            if (responseDedupCache.containsKey(key)) return false;
+            responseDedupCache.put(key, Boolean.TRUE);
+            return true;
+        }
+    }
+
+    int analyzeContent(String url, String responseBody, HttpRequestResponse reqResp, ScannerConfig config) {
+        int count = 0;
+        String evidenceId = EvidenceRecord.responseHash(responseBody);
+        List<ResultsTab.FindingCandidate> candidates = new ArrayList<>();
+        // getRules() returns a defensive copy — safe to iterate on background thread
+        for (CompiledRule rule : config.rules()) {
 
             try {
-                List<MatchResult> matches = findMatchesWithTimeout(pattern, responseBody, REGEX_TIMEOUT_MS, MAX_MATCHES_PER_RULE);
+                List<MatchResult> matches = findMatches(rule.pattern(), responseBody, MAX_MATCHES_PER_RULE);
                 for (MatchResult match : matches) {
                     String finding = match.finding;
-                    if (isNoise(rule.getType(), finding)) continue;
+                    if (isNoise(config, rule.type(), finding)) continue;
 
                     // Entropy-assisted severity correction
-                    String effectiveSeverity = adjustSeverityByEntropy(rule.getSeverity(), rule.getType(), finding);
+                    String effectiveSeverity = applyEntropyPolicy(rule.severity(), rule.type(), rule.entropyPolicy(), finding);
+                    if (effectiveSeverity == null) continue;
 
                     // Context window around the match
                     String context = extractContext(responseBody, match.start, match.end);
 
-                    resultsTab.addFinding(rule.getType(), finding, rule.getName(),
-                        url, reqResp, match.start, match.end, effectiveSeverity, context);
-                    statsTab.recordFinding(url, rule.getType(), effectiveSeverity);
+                    candidates.add(new ResultsTab.FindingCandidate(rule.type(), finding, rule.name(), url, evidenceId,
+                        reqResp, match.start, match.end, effectiveSeverity, context));
                     count++;
                     if (count >= MAX_FINDINGS_PER_RESPONSE) {
                         log(LogLevel.WARN, "Finding cap reached on: " + url);
+                        resultsTab.addFindingsBatch(candidates);
                         return count;
                     }
                 }
-                regexTimeoutCounts.remove(rule.getName());
-            } catch (TimeoutException e) {
-                log(LogLevel.WARN, "Regex timeout for rule '" + rule.getName() + "' on: " + url);
-                int timeouts = regexTimeoutCounts
-                    .computeIfAbsent(rule.getName(), ignored -> new AtomicInteger(0))
-                    .incrementAndGet();
-                if (timeouts >= RULE_TIMEOUT_SUSPEND_THRESHOLD && suspendedRules.add(rule.getName())) {
-                    log(LogLevel.WARN, "Temporarily disabling rule for this session after repeated timeouts: " + rule.getName());
-                }
             } catch (Exception e) {
-                log(LogLevel.DEBUG, "Regex error for rule '" + rule.getName() + "': " + e.getMessage());
+                log(LogLevel.DEBUG, "Regex error for rule '" + rule.name() + "': " + e.getMessage());
             }
         }
+        resultsTab.addFindingsBatch(candidates);
         return count;
     }
 
-    private String adjustSeverityByEntropy(String declared, String type, String finding) {
-        if (!"SECRET".equals(type) || finding.length() < 16) return declared;
+    private String applyEntropyPolicy(String declared, String type, EntropyPolicy policy, String finding) {
+        if (policy == EntropyPolicy.NONE || !"SECRET".equals(type) || finding.length() < 16) return declared;
         double entropy = EntropyAnalyzer.calculateEntropy(finding);
+        if (policy == EntropyPolicy.REQUIRE_MINIMUM) return entropy >= 3.0 ? declared : null;
         // Very low entropy → almost certainly a placeholder/variable name
         if (entropy < 2.5 && ("HIGH".equals(declared) || "MEDIUM".equals(declared))) {
             log(LogLevel.DEBUG, "Downgrading low-entropy SECRET to INFO: '" + finding + "' (entropy=" + String.format("%.2f", entropy) + ")");
@@ -275,35 +347,16 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         return body.substring(ctxStart, ctxEnd).replaceAll("[\\s]+", " ").trim();
     }
 
-    // Uses the SHARED regexTimeoutPool — no new pool created per call
-    private List<MatchResult> findMatchesWithTimeout(Pattern pattern, String input, long timeoutMs, int maxMatches)
-            throws TimeoutException {
-        Future<List<MatchResult>> future;
-        try {
-            future = regexTimeoutPool.submit(() -> {
-                List<MatchResult> matches = new ArrayList<>();
-                Matcher matcher = pattern.matcher(input);
-                while (matcher.find()) {
-                    if (Thread.currentThread().isInterrupted()) break;
-                    int groupIndex = extractPreferredGroupIndex(matcher);
-                    String finding = matcher.group(groupIndex);
-                    matches.add(new MatchResult(finding, matcher.start(groupIndex), matcher.end(groupIndex)));
-                    if (matches.size() >= maxMatches) break;
-                }
-                return matches;
-            });
-        } catch (RejectedExecutionException e) {
-            throw new TimeoutException("Regex queue saturated");
+    private List<MatchResult> findMatches(Pattern pattern, String input, int maxMatches) {
+        List<MatchResult> matches = new ArrayList<>();
+        Matcher matcher = pattern.matcher(input);
+        while (matcher.find()) {
+            int groupIndex = extractPreferredGroupIndex(matcher);
+            String finding = matcher.group(groupIndex);
+            matches.add(new MatchResult(finding, matcher.start(groupIndex), matcher.end(groupIndex)));
+            if (matches.size() >= maxMatches) break;
         }
-        try {
-            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (java.util.concurrent.TimeoutException e) {
-            future.cancel(true);
-            throw new TimeoutException("Regex matching timed out");
-        } catch (InterruptedException | ExecutionException e) {
-            future.cancel(true);
-            throw new RuntimeException("Regex matching failed", e);
-        }
+        return matches;
     }
 
     private int extractPreferredGroupIndex(Matcher matcher) {
@@ -321,20 +374,20 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         }
     }
 
-    private boolean isNoise(String type, String finding) {
+    private boolean isNoise(ScannerConfig config, String type, String finding) {
         if (finding == null || finding.length() < 5) return true;
         // Atomic read — always a complete, immutable snapshot
-        for (Pattern noise : noisePatterns.get()) {
+        for (Pattern noise : config.noisePatterns()) {
             try { if (noise.matcher(finding).find()) return true; }
             catch (Exception ignored) { }
         }
         if ("URL".equals(type) || "ENDPOINT".equals(type)) {
-            for (String domain : getNoiseDomains()) {
+            for (String domain : config.noiseDomains()) {
                 if (finding.contains(domain)) return true;
             }
         }
         if ("ENDPOINT".equals(type) || "FILE".equals(type)) {
-            for (String prefix : getModulePrefixes()) {
+            for (String prefix : config.modulePrefixes()) {
                 if (finding.startsWith(prefix)) return true;
             }
         }
@@ -351,20 +404,23 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         try {
             executorService.submit(() -> analyzeResponse(responseReceived));
         } catch (RejectedExecutionException e) {
-            log(LogLevel.WARN, "Task queue full, skipping: " + responseReceived.initiatingRequest().url());
+            // The rejection handler has already counted and rate-limited this drop.
         }
         return ResponseReceivedAction.continueWith(responseReceived);
     }
 
     private void analyzeResponse(HttpResponseReceived responseReceived) {
         String url = responseReceived.initiatingRequest().url();
-        if (!shouldAnalyze(url, responseReceived)) return;
+        ScannerConfig config = activeConfig.get();
+        if (!shouldAnalyze(url, responseReceived, config)) return;
         String body = responseReceived.bodyToString();
         if (body == null || body.isEmpty()) return;
+        if (!isMostlyPrintable(body)) return;
+        if (!shouldScanResponse(url, body, config)) return;
         log(LogLevel.DEBUG, "Analyzing: " + url);
         HttpRequestResponse reqResp = HttpRequestResponse.httpRequestResponse(
             responseReceived.initiatingRequest(), responseReceived);
-        analyzeContent(url, body, reqResp);
+        analyzeContent(url, body, reqResp, config);
     }
 
     @Override
@@ -372,10 +428,14 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         log(LogLevel.INFO, "JS Miner Pro unloading...");
         if (resultsTab != null) {
             resultsTab.saveAllFindings();
-            log(LogLevel.INFO, "Findings saved on unload.");
+            if (clearFindingsOnProjectClose) {
+                resultsTab.clearPersistedFindings();
+                log(LogLevel.INFO, "Persisted findings cleared on unload.");
+            } else {
+                log(LogLevel.INFO, "Findings saved on unload.");
+            }
         }
         shutdownPool(executorService,   "analysis pool");
-        shutdownPool(regexTimeoutPool,  "regex timeout pool");
         shutdownPool(autoSaveScheduler, "auto-save scheduler");
     }
 
