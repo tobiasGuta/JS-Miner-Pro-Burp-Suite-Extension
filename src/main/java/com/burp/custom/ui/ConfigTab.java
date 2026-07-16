@@ -203,8 +203,10 @@ public class ConfigTab extends JPanel {
             "Noise Patterns: Regex patterns applied to the matched value.\n\n" +
             "Noise Domains: Domains to ignore in URL/endpoint findings.\n\n" +
             "Module Prefixes: Relative import paths to ignore.\n\n" +
-            "Entropy scoring: LOW-entropy SECRET matches are automatically\n" +
-            "downgraded to INFO regardless of rule severity.");
+            "Entropy Policy:\n" +
+            "NONE - entropy does not alter the result.\n" +
+            "REQUIRE_MINIMUM - findings below the minimum entropy are discarded.\n" +
+            "ADJUST_SEVERITY - severity may be raised or lowered based on entropy.");
         helpText.setEditable(false);
         helpText.setBackground(panel.getBackground());
         helpText.setFont(helpText.getFont().deriveFont(Font.PLAIN, 11f));

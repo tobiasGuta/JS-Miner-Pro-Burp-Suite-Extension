@@ -47,6 +47,7 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
     private final AtomicLong droppedResponses = new AtomicLong();
     private final AtomicLong lastDropWarningMillis = new AtomicLong();
     private final AtomicBoolean historyScanRunning = new AtomicBoolean();
+    private final AtomicBoolean acceptingResponses = new AtomicBoolean(true);
     private final Map<String, Boolean> responseDedupCache = Collections.synchronizedMap(
         new LinkedHashMap<>(256, 0.75f, true) {
             @Override protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) { return size() > 1_024; }
@@ -279,7 +280,7 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
     }
 
     private boolean shouldScanResponse(String url, String body, ScannerConfig config) {
-        String canonicalUrl = url.split("\\?", 2)[0];
+        String canonicalUrl = canonicalUrl(url);
         String key = canonicalUrl + "\n" + EvidenceRecord.responseHash(body) + "\n" + config.rulesetVersion();
         synchronized (responseDedupCache) {
             if (responseDedupCache.containsKey(key)) return false;
@@ -288,9 +289,16 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         }
     }
 
+    private String canonicalUrl(String url) {
+        return url.split("\\?", 2)[0];
+    }
+
     int analyzeContent(String url, String responseBody, HttpRequestResponse reqResp, ScannerConfig config) {
         int count = 0;
-        String evidenceId = EvidenceRecord.responseHash(responseBody);
+        String responseHash = EvidenceRecord.responseHash(responseBody);
+        String requestMethod = reqResp.request() != null ? reqResp.request().method() : "";
+        String requestBody = reqResp.request() != null ? reqResp.request().bodyToString() : "";
+        String evidenceId = EvidenceRecord.evidenceId(requestMethod, canonicalUrl(url), requestBody, responseHash);
         List<ResultsTab.FindingCandidate> candidates = new ArrayList<>();
         // getRules() returns a defensive copy — safe to iterate on background thread
         for (CompiledRule rule : config.rules()) {
@@ -308,7 +316,7 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
                     // Context window around the match
                     String context = extractContext(responseBody, match.start, match.end);
 
-                    candidates.add(new ResultsTab.FindingCandidate(rule.type(), finding, rule.name(), url, evidenceId,
+                    candidates.add(new ResultsTab.FindingCandidate(rule.type(), finding, rule.name(), url, evidenceId, responseHash,
                         reqResp, match.start, match.end, effectiveSeverity, context));
                     count++;
                     if (count >= MAX_FINDINGS_PER_RESPONSE) {
@@ -401,6 +409,7 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
 
     @Override
     public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived responseReceived) {
+        if (!acceptingResponses.get()) return ResponseReceivedAction.continueWith(responseReceived);
         try {
             executorService.submit(() -> analyzeResponse(responseReceived));
         } catch (RejectedExecutionException e) {
@@ -426,6 +435,9 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
     @Override
     public void extensionUnloaded() {
         log(LogLevel.INFO, "JS Miner Pro unloading...");
+        acceptingResponses.set(false);
+        shutdownPool(executorService, "analysis pool");
+        drainPendingFindingBatches();
         if (resultsTab != null) {
             resultsTab.saveAllFindings();
             if (clearFindingsOnProjectClose) {
@@ -435,8 +447,19 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
                 log(LogLevel.INFO, "Findings saved on unload.");
             }
         }
-        shutdownPool(executorService,   "analysis pool");
         shutdownPool(autoSaveScheduler, "auto-save scheduler");
+    }
+
+    private void drainPendingFindingBatches() {
+        if (SwingUtilities.isEventDispatchThread()) return;
+        try {
+            SwingUtilities.invokeAndWait(() -> { });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log(LogLevel.WARN, "Interrupted while draining pending finding updates.");
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            log(LogLevel.WARN, "Failed to drain pending finding updates: " + e.getCause());
+        }
     }
 
     private void shutdownPool(ExecutorService pool, String name) {

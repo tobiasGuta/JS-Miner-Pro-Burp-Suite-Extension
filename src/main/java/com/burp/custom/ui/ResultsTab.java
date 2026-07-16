@@ -281,7 +281,7 @@ public class ResultsTab extends JPanel {
 
                     EvidenceRecord evidence = evidenceById.get(candidate.evidenceId());
                     if (evidence == null) {
-                        evidence = new EvidenceRecord(candidate.url(), candidate.requestResponse(), candidate.evidenceId());
+                        evidence = new EvidenceRecord(candidate.url(), candidate.requestResponse(), candidate.evidenceId(), candidate.responseHash());
                         evidenceById.put(candidate.evidenceId(), evidence);
                     }
                     Finding finding = new Finding(candidate.type(), candidate.finding(), candidate.ruleName(), candidate.url(),
@@ -303,7 +303,7 @@ public class ResultsTab extends JPanel {
         });
     }
 
-    public record FindingCandidate(String type, String finding, String ruleName, String url, String evidenceId,
+    public record FindingCandidate(String type, String finding, String ruleName, String url, String evidenceId, String responseHash,
                                    HttpRequestResponse requestResponse, int start, int end, String severity, String context) { }
 
     public void setStatsTab(StatsTab statsTab) {
@@ -312,9 +312,14 @@ public class ResultsTab extends JPanel {
     }
 
     public void setRetentionOptions(int globalLimit, int perHostLimit, boolean persistRawHttp) {
-        this.globalFindingLimit = Math.max(1, globalLimit);
-        this.perHostFindingLimit = Math.max(1, perHostLimit);
-        this.persistRawHttp = persistRawHttp;
+        synchronized (findingsLock) {
+            this.globalFindingLimit = Math.max(1, globalLimit);
+            this.perHostFindingLimit = Math.max(1, perHostLimit);
+            this.persistRawHttp = persistRawHttp;
+            pruneToRetentionLimitsLocked();
+        }
+        rebuildTable();
+        synchronizeStats();
     }
 
     // -------------------------------------------------------------------------
@@ -510,7 +515,7 @@ public class ResultsTab extends JPanel {
         }
     }
 
-    private String csv(String v) {
+    static String csv(String v) {
         if (v == null) return "";
         String sanitized = v.replace("\"", "\"\"").replace("\n", " ").replace("\r", "");
         if (!sanitized.isEmpty() && "=+-@".indexOf(sanitized.charAt(0)) >= 0) return "'" + sanitized;
@@ -562,6 +567,10 @@ public class ResultsTab extends JPanel {
                 }
                 for (Finding f : persisted.findings) {
                     if (!uniqueUrlScopedKeys.add(f.getUrlScopedKey())) continue;
+                    if (findingsList.size() >= globalFindingLimit || hostFindingCountLocked(f.getUrl()) >= perHostFindingLimit) {
+                        uniqueUrlScopedKeys.remove(f.getUrlScopedKey());
+                        continue;
+                    }
                     findingsList.add(f);
                     EntropyAnalyzer.EntropyResult er = EntropyAnalyzer.analyze(f.getFinding());
                     secretToUrls.computeIfAbsent(f.getFinding(), k -> new LinkedHashSet<>()).add(f.getUrl());
@@ -658,6 +667,41 @@ public class ResultsTab extends JPanel {
             .filter(Objects::nonNull).collect(java.util.stream.Collectors.toSet()));
 
         refreshReuseCountsLocked();
+    }
+
+    private void pruneToRetentionLimitsLocked() {
+        Map<String, Integer> hostCounts = new HashMap<>();
+        List<Finding> retained = new ArrayList<>();
+        for (Finding finding : findingsList) {
+            if (retained.size() >= globalFindingLimit) break;
+            String host = hostFor(finding.getUrl());
+            int hostCount = hostCounts.getOrDefault(host, 0);
+            if (hostCount >= perHostFindingLimit) continue;
+            retained.add(finding);
+            hostCounts.put(host, hostCount + 1);
+        }
+        if (retained.size() != findingsList.size()) {
+            findingsList.clear();
+            findingsList.addAll(retained);
+        }
+        rebuildDerivedStateLocked();
+    }
+
+    private void rebuildTable() {
+        Runnable rebuild = () -> {
+            synchronized (findingsLock) {
+                tableModel.setRowCount(0);
+                for (Finding finding : findingsList) {
+                    EntropyAnalyzer.EntropyResult entropy = EntropyAnalyzer.analyze(finding.getFinding());
+                    tableModel.addRow(new Object[]{finding.getSeverity(), finding.getType(), finding.getFinding(), finding.getRuleName(),
+                        entropy.level, "1", finding.getContext(), finding.getUrl()});
+                }
+                refreshReuseCountsLocked();
+                statsLabel.setText(findingsList.size() + " finding" + (findingsList.size() == 1 ? "" : "s"));
+            }
+        };
+        if (SwingUtilities.isEventDispatchThread()) rebuild.run();
+        else SwingUtilities.invokeLater(rebuild);
     }
 
     private void refreshReuseCountsLocked() {

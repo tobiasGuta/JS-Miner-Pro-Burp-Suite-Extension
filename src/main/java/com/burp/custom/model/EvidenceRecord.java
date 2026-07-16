@@ -20,19 +20,18 @@ public class EvidenceRecord {
     private transient HttpRequestResponse requestResponse;
 
     public EvidenceRecord(String url, HttpRequestResponse requestResponse) {
-        this(url, requestResponse, null);
+        this(url, requestResponse, null, null);
     }
 
-    public EvidenceRecord(String url, HttpRequestResponse requestResponse, String knownResponseHash) {
+    public EvidenceRecord(String url, HttpRequestResponse requestResponse, String knownId, String knownResponseHash) {
         this.url = url;
-        this.requestResponse = null;
-        this.requestString = requestResponse != null && requestResponse.request() != null
-            ? copyIfAtMost(requestResponse.request().toString(), MAX_REQUEST_CHARS) : null;
+        this.requestResponse = requestResponse;
+        this.requestString = null;
         String rawResponse = requestResponse != null && requestResponse.response() != null
             ? requestResponse.response().toString() : "";
-        this.responseString = copyIfAtMost(rawResponse, MAX_RESPONSE_CHARS);
+        this.responseString = null;
         this.responseHash = knownResponseHash != null ? knownResponseHash : sha256(rawResponse);
-        this.id = responseHash;
+        this.id = knownId != null ? knownId : responseHash;
     }
 
     public EvidenceRecord(String id, String url, String responseHash, String requestString, String responseString) {
@@ -61,11 +60,15 @@ public class EvidenceRecord {
     }
 
     public EvidenceRecord forPersistence(boolean includeRawHttp) {
+        String persistedRequest = requestResponse != null && requestResponse.request() != null
+            ? copyIfAtMost(requestResponse.request().toString(), MAX_REQUEST_CHARS) : requestString;
+        String persistedResponse = requestResponse != null && requestResponse.response() != null
+            ? copyIfAtMost(requestResponse.response().toString(), MAX_RESPONSE_CHARS) : responseString;
         return new EvidenceRecord(id, url, responseHash,
-            includeRawHttp ? requestString : null, includeRawHttp ? responseString : null);
+            includeRawHttp ? persistedRequest : null, includeRawHttp ? persistedResponse : null);
     }
 
-    private static String sha256(String value) {
+    public static String sha256(String value) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
             StringBuilder hex = new StringBuilder(digest.length * 2);
@@ -78,6 +81,11 @@ public class EvidenceRecord {
 
     public static String responseHash(String response) {
         return sha256(response == null ? "" : response);
+    }
+
+    public static String evidenceId(String method, String canonicalUrl, String requestBody, String responseHash) {
+        return sha256((method == null ? "" : method) + "\0" + (canonicalUrl == null ? "" : canonicalUrl) + "\0" +
+            sha256(requestBody) + "\0" + (responseHash == null ? "" : responseHash));
     }
 
     private static String copyIfAtMost(String value, int maxChars) {
