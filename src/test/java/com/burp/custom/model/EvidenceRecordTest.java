@@ -3,6 +3,7 @@ package com.burp.custom.model;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
 class EvidenceRecordTest {
     @Test
@@ -23,5 +24,11 @@ class EvidenceRecordTest {
         String second = EvidenceRecord.evidenceId("POST", "https://target.example/api", "second", responseHash);
 
         assertNotEquals(first, second);
+    }
+
+    @Test
+    void acceptsNullRequestBodies() {
+        assertDoesNotThrow(() -> EvidenceRecord.evidenceId("GET", "https://target.example/asset.js", null,
+            EvidenceRecord.responseHash("response")));
     }
 }

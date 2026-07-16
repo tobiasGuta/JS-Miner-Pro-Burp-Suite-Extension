@@ -85,7 +85,7 @@ public class EvidenceRecord {
 
     public static String evidenceId(String method, String canonicalUrl, String requestBody, String responseHash) {
         return sha256((method == null ? "" : method) + "\0" + (canonicalUrl == null ? "" : canonicalUrl) + "\0" +
-            sha256(requestBody) + "\0" + (responseHash == null ? "" : responseHash));
+            sha256(requestBody == null ? "" : requestBody) + "\0" + (responseHash == null ? "" : responseHash));
     }
 
     private static String copyIfAtMost(String value, int maxChars) {

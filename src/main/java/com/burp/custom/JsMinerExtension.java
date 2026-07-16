@@ -75,6 +75,8 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         resultsTab = new ResultsTab(api, this);
         statsTab   = new StatsTab(api);
         resultsTab.setStatsTab(statsTab);
+        configTab.applyScannerConfig();
+        resultsTab.loadPersistedFindings();
 
         BlockingQueue<Runnable> workQueue = new LinkedBlockingQueue<>(1000);
         this.executorService = new ThreadPoolExecutor(
@@ -103,7 +105,6 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
         api.http().registerHttpHandler(this);
         api.extension().registerUnloadingHandler(this);
 
-        configTab.applyScannerConfig();
         log(LogLevel.INFO, "JS Miner Pro loaded successfully.");
     }
 
@@ -436,18 +437,18 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
     public void extensionUnloaded() {
         log(LogLevel.INFO, "JS Miner Pro unloading...");
         acceptingResponses.set(false);
+        shutdownPool(autoSaveScheduler, "auto-save scheduler");
         shutdownPool(executorService, "analysis pool");
         drainPendingFindingBatches();
         if (resultsTab != null) {
-            resultsTab.saveAllFindings();
             if (clearFindingsOnProjectClose) {
                 resultsTab.clearPersistedFindings();
                 log(LogLevel.INFO, "Persisted findings cleared on unload.");
             } else {
+                resultsTab.saveAllFindings();
                 log(LogLevel.INFO, "Findings saved on unload.");
             }
         }
-        shutdownPool(autoSaveScheduler, "auto-save scheduler");
     }
 
     private void drainPendingFindingBatches() {

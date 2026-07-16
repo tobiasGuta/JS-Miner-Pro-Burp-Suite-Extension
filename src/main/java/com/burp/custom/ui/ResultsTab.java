@@ -57,6 +57,7 @@ public class ResultsTab extends JPanel {
     private volatile int globalFindingLimit = 1_000;
     private volatile int perHostFindingLimit = 100;
     private volatile boolean persistRawHttp = true;
+    private boolean persistedFindingsLoaded;
 
     private JComboBox<String> severityFilter;
     private JComboBox<String> typeFilter;
@@ -259,7 +260,6 @@ public class ResultsTab extends JPanel {
         });
 
         setupContextMenu();
-        loadFindings();
     }
 
     // -------------------------------------------------------------------------
@@ -416,11 +416,10 @@ public class ResultsTab extends JPanel {
         synchronized (findingsLock) {
             if (modelRow >= 0 && modelRow < findingsList.size()) {
                 findingsList.remove(modelRow);
-                tableModel.removeRow(modelRow);
                 rebuildDerivedStateLocked();
-                statsLabel.setText(findingsList.size() + " finding" + (findingsList.size() == 1 ? "" : "s"));
             }
         }
+        rebuildTable();
         synchronizeStats();
     }
 
@@ -543,7 +542,11 @@ public class ResultsTab extends JPanel {
         }
     }
 
-    private void loadFindings() {
+    public void loadPersistedFindings() {
+        synchronized (findingsLock) {
+            if (persistedFindingsLoaded) return;
+            persistedFindingsLoaded = true;
+        }
         try {
             PersistedObject prefs = api.persistence().extensionData();
             String json = prefs.getString(FINDINGS_KEY);
@@ -663,10 +666,12 @@ public class ResultsTab extends JPanel {
             findingToRows.computeIfAbsent(finding.getFinding(), k -> new ArrayList<>()).add(idx);
         }
 
+        removeUnusedEvidenceLocked();
+    }
+
+    private void removeUnusedEvidenceLocked() {
         evidenceById.keySet().retainAll(findingsList.stream().map(Finding::getEvidenceId)
             .filter(Objects::nonNull).collect(java.util.stream.Collectors.toSet()));
-
-        refreshReuseCountsLocked();
     }
 
     private void pruneToRetentionLimitsLocked() {
