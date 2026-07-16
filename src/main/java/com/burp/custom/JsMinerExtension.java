@@ -297,9 +297,10 @@ public class JsMinerExtension implements BurpExtension, HttpHandler, ExtensionUn
     int analyzeContent(String url, String responseBody, HttpRequestResponse reqResp, ScannerConfig config) {
         int count = 0;
         String responseHash = EvidenceRecord.responseHash(responseBody);
-        String requestMethod = reqResp.request() != null ? reqResp.request().method() : "";
-        String requestBody = reqResp.request() != null ? reqResp.request().bodyToString() : "";
-        String evidenceId = EvidenceRecord.evidenceId(requestMethod, canonicalUrl(url), requestBody, responseHash);
+        // Evidence must identify the actual request, including its query parameters and headers.
+        // Scan de-duplication deliberately uses canonicalUrl(), but evidence must not.
+        String rawRequest = reqResp.request() != null ? reqResp.request().toString() : "";
+        String evidenceId = EvidenceRecord.evidenceId(rawRequest, responseHash);
         List<ResultsTab.FindingCandidate> candidates = new ArrayList<>();
         // getRules() returns a defensive copy — safe to iterate on background thread
         for (CompiledRule rule : config.rules()) {

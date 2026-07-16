@@ -27,6 +27,29 @@ class EvidenceRecordTest {
     }
 
     @Test
+    void separatesDifferentQueryStrings() {
+        String responseHash = EvidenceRecord.responseHash("same response");
+
+        String first = EvidenceRecord.evidenceId(
+            "GET", "https://target.example/app.js?v=1", "", responseHash);
+        String second = EvidenceRecord.evidenceId(
+            "GET", "https://target.example/app.js?v=2", "", responseHash);
+
+        assertNotEquals(first, second);
+    }
+
+    @Test
+    void separatesDifferentRequestHeadersForTheSameUrlAndBody() {
+        String responseHash = EvidenceRecord.responseHash("same response");
+        String first = EvidenceRecord.evidenceId(
+            "GET /app.js HTTP/1.1\r\nHost: target.example\r\nX-Variant: first\r\n\r\n", responseHash);
+        String second = EvidenceRecord.evidenceId(
+            "GET /app.js HTTP/1.1\r\nHost: target.example\r\nX-Variant: second\r\n\r\n", responseHash);
+
+        assertNotEquals(first, second);
+    }
+
+    @Test
     void acceptsNullRequestBodies() {
         assertDoesNotThrow(() -> EvidenceRecord.evidenceId("GET", "https://target.example/asset.js", null,
             EvidenceRecord.responseHash("response")));

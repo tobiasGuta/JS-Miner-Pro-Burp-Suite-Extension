@@ -575,33 +575,17 @@ public class ResultsTab extends JPanel {
                         continue;
                     }
                     findingsList.add(f);
-                    EntropyAnalyzer.EntropyResult er = EntropyAnalyzer.analyze(f.getFinding());
                     secretToUrls.computeIfAbsent(f.getFinding(), k -> new LinkedHashSet<>()).add(f.getUrl());
-                    int reuse = secretToUrls.get(f.getFinding()).size();
 
                     int rowIdx = findingsList.size() - 1;
                     findingToRows.computeIfAbsent(f.getFinding(), k -> new ArrayList<>()).add(rowIdx);
-
-                    tableModel.addRow(new Object[]{
-                        f.getSeverity(), f.getType(), f.getFinding(), f.getRuleName(),
-                        er.level, String.valueOf(reuse), f.getContext(), f.getUrl()
-                    });
                 }
+                // Retention can reject findings while all persisted evidence was loaded above.
+                // Keep only evidence referenced by the retained findings before a later save.
+                removeUnusedEvidenceLocked();
             }
 
-            // Refresh reuse counts after all rows are loaded
-            SwingUtilities.invokeLater(() -> {
-                synchronized (findingsLock) {
-                    for (Map.Entry<String, List<Integer>> entry : findingToRows.entrySet()) {
-                        int count = secretToUrls.getOrDefault(entry.getKey(), Collections.emptySet()).size();
-                        for (int idx : entry.getValue()) {
-                            tableModel.setValueAt(String.valueOf(count), idx, COL_REUSE);
-                        }
-                    }
-                    statsLabel.setText(findingsList.size() + " finding" + (findingsList.size() == 1 ? "" : "s"));
-                }
-            });
-
+            rebuildTable();
             synchronizeStats();
 
         } catch (Exception e) {

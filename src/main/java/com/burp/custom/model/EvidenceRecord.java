@@ -83,8 +83,20 @@ public class EvidenceRecord {
         return sha256(response == null ? "" : response);
     }
 
-    public static String evidenceId(String method, String canonicalUrl, String requestBody, String responseHash) {
-        return sha256((method == null ? "" : method) + "\0" + (canonicalUrl == null ? "" : canonicalUrl) + "\0" +
+    /**
+     * Produces an identity from the complete raw request and its response hash. This preserves
+     * query parameters, headers, and request content for evidence lookups.
+     */
+    public static String evidenceId(String rawRequest, String responseHash) {
+        return sha256((rawRequest == null ? "" : rawRequest) + "\0" + (responseHash == null ? "" : responseHash));
+    }
+
+    /**
+     * Produces an identity from structured request fields. Callers must supply the complete URL,
+     * including query parameters; this overload remains useful for persistence and tests.
+     */
+    public static String evidenceId(String method, String url, String requestBody, String responseHash) {
+        return sha256((method == null ? "" : method) + "\0" + (url == null ? "" : url) + "\0" +
             sha256(requestBody == null ? "" : requestBody) + "\0" + (responseHash == null ? "" : responseHash));
     }
 
